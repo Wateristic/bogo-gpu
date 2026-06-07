@@ -1,13 +1,13 @@
 // src/compute/amd/mod.rs  —  HIP/ROCm backend (--features hip)
-
+ 
 use anyhow::{anyhow, Result};
-
+ 
 #[cfg(feature = "hip")]
 static HSACO: &[u8] = include_bytes!(env!("KERNEL_HSACO_PATH"));
-
+ 
 #[allow(non_camel_case_types)] type hipError_t  = i32;
 #[allow(non_camel_case_types)] type hipDevice_t = i32;
-
+ 
 #[repr(C)] #[derive(Clone, Copy)] struct hipDeviceptr_t(*mut std::ffi::c_void);
 unsafe impl Send for hipDeviceptr_t {}
 unsafe impl Sync for hipDeviceptr_t {}
@@ -17,9 +17,9 @@ unsafe impl Send for hipModule_t {}
 unsafe impl Send for hipFunction_t {}
 #[repr(C)] #[derive(Clone, Copy)] struct hipStream_t(*mut std::ffi::c_void);
 unsafe impl Send for hipStream_t {}
-
+ 
 const HIP_SUCCESS: hipError_t = 0;
-
+ 
 #[link(name = "amdhip64")]
 extern "C" {
     fn hipInit(flags: u32) -> hipError_t;
@@ -39,7 +39,7 @@ extern "C" {
     ) -> hipError_t;
     fn hipDeviceSynchronize() -> hipError_t;
 }
-
+ 
 macro_rules! hip_check {
     ($expr:expr) => {{
         let err = $expr;
@@ -48,7 +48,7 @@ macro_rules! hip_check {
         }
     }};
 }
-
+ 
 pub struct HipWorker {
     module:         hipModule_t,
     func:           hipFunction_t,
@@ -56,7 +56,7 @@ pub struct HipWorker {
     pub threads:    u32,
     pub chunk_size: u32,
 }
-
+ 
 impl HipWorker {
     pub fn new(blocks: u32, threads: u32, chunk_size: u32) -> Result<Self> {
         unsafe {
@@ -69,57 +69,69 @@ impl HipWorker {
             Ok(HipWorker { module, func, blocks, threads, chunk_size })
         }
     }
-
+ 
     pub fn run_batch(&self, seed: u64, base_index: u64, count: u32) -> Result<(u32, u64)> {
-        let total = (self.blocks * self.threads) as usize;
+        let blocks = self.blocks as usize;
         unsafe {
-            let mut d_correct_raw:  *mut std::ffi::c_void = std::ptr::null_mut();
-            let mut d_index_lo_raw: *mut std::ffi::c_void = std::ptr::null_mut();
-            let mut d_index_hi_raw: *mut std::ffi::c_void = std::ptr::null_mut();
-            hip_check!(hipMalloc(&mut d_correct_raw,  total * 4));
-            hip_check!(hipMalloc(&mut d_index_lo_raw, total * 4));
-            hip_check!(hipMalloc(&mut d_index_hi_raw, total * 4));
-            hip_check!(hipMemset(d_correct_raw,  0, total * 4));
-            hip_check!(hipMemset(d_index_lo_raw, 0, total * 4));
-            hip_check!(hipMemset(d_index_hi_raw, 0, total * 4));
+            let mut d_best_bid_raw: *mut std::ffi::c_void = std::ptr::null_mut();
+            let mut d_indices_raw:  *mut std::ffi::c_void = std::ptr::null_mut();
+            let mut d_arrays_raw:   *mut std::ffi::c_void = std::ptr::null_mut();
+ 
+            hip_check!(hipMalloc(&mut d_best_bid_raw, 8));              // 1 x u64 packed (score<<32)|blk
+            hip_check!(hipMalloc(&mut d_indices_raw,  blocks * 8));     // blocks x u64
+            hip_check!(hipMalloc(&mut d_arrays_raw,   blocks * 25));    // blocks x 25 x u8
+ 
+            hip_check!(hipMemset(d_best_bid_raw, 0, 8));
+            hip_check!(hipMemset(d_indices_raw,  0, blocks * 8));
+            hip_check!(hipMemset(d_arrays_raw,   0, blocks * 25));
+ 
             let mut seed_arg     = seed;
             let mut base_arg     = base_index;
             let mut count_arg    = count;
             let mut cs_arg       = self.chunk_size;
-            let mut correct_arg  = d_correct_raw;
-            let mut index_lo_arg = d_index_lo_raw;
-            let mut index_hi_arg = d_index_hi_raw;
+            let mut best_bid_arg = d_best_bid_raw;
+            let mut indices_arg  = d_indices_raw;
+            let mut arrays_arg   = d_arrays_raw;
+ 
             let mut args: [*mut std::ffi::c_void; 7] = [
                 &mut seed_arg     as *mut _ as *mut _,
                 &mut base_arg     as *mut _ as *mut _,
                 &mut count_arg    as *mut _ as *mut _,
                 &mut cs_arg       as *mut _ as *mut _,
-                &mut correct_arg  as *mut _ as *mut _,
-                &mut index_lo_arg as *mut _ as *mut _,
-                &mut index_hi_arg as *mut _ as *mut _,
+                &mut best_bid_arg as *mut _ as *mut _,
+                &mut indices_arg  as *mut _ as *mut _,
+                &mut arrays_arg   as *mut _ as *mut _,
             ];
+ 
             hip_check!(hipModuleLaunchKernel(
                 self.func, self.blocks, 1, 1, self.threads, 1, 1,
                 0, hipStream_t(std::ptr::null_mut()), args.as_mut_ptr(), std::ptr::null_mut(),
             ));
             hip_check!(hipDeviceSynchronize());
-            let mut correct  = vec![0u32; total];
-            let mut index_lo = vec![0u32; total];
-            let mut index_hi = vec![0u32; total];
-            hip_check!(hipMemcpyDtoH(correct.as_mut_ptr()  as *mut _, d_correct_raw,  total * 4));
-            hip_check!(hipMemcpyDtoH(index_lo.as_mut_ptr() as *mut _, d_index_lo_raw, total * 4));
-            hip_check!(hipMemcpyDtoH(index_hi.as_mut_ptr() as *mut _, d_index_hi_raw, total * 4));
-            hip_check!(hipFree(d_correct_raw));
-            hip_check!(hipFree(d_index_lo_raw));
-            hip_check!(hipFree(d_index_hi_raw));
-            let mut best_correct = 0u32;
-            let mut best_index   = base_index;
-            for i in 0..total {
-                if correct[i] > best_correct {
-                    best_correct = correct[i];
-                    best_index   = (index_lo[i] as u64) | ((index_hi[i] as u64) << 32);
-                }
-            }
+ 
+            // Read packed (score << 32) | block_id
+            let mut best_and_bid = 0u64;
+            hip_check!(hipMemcpyDtoH(
+                &mut best_and_bid as *mut u64 as *mut _,
+                d_best_bid_raw,
+                8,
+            ));
+ 
+            let best_correct = (best_and_bid >> 32) as u32;
+            let best_block   = (best_and_bid & 0xFFFF_FFFF) as usize;
+ 
+            // Read just the winning block's index
+            let mut best_index = base_index;
+            hip_check!(hipMemcpyDtoH(
+                &mut best_index as *mut u64 as *mut _,
+                (d_indices_raw as *mut u8).add(best_block * 8) as *mut _,
+                8,
+            ));
+ 
+            hip_check!(hipFree(d_best_bid_raw));
+            hip_check!(hipFree(d_indices_raw));
+            hip_check!(hipFree(d_arrays_raw));
+ 
             Ok((best_correct, best_index))
         }
     }
