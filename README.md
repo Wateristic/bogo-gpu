@@ -130,6 +130,8 @@ cargo build --release --no-default-features
 ## Running
 
 For CUDA:
+
+Run using the x64 Native Tools Command Prompt for VS 2022
 ```sh
 cargo run --release
 ```
