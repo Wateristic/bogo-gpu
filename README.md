@@ -129,10 +129,14 @@ cargo build --release --no-default-features
 
 ## Running
 
+For CUDA:
 ```sh
 cargo run --release
 ```
-
+For AMD:
+```sh
+cargo run --release --no-default-features --features hip
+```
 Or run the compiled binary directly:
 
 ```sh
