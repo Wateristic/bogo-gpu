@@ -104,7 +104,7 @@ Common `HIP_ARCH` values:
 | RDNA 2 | RX 6900 XT, 6700 XT | `gfx1030` |
 | Vega 20 | Radeon VII, MI50 | `gfx906` |
 
-To find your exact arch: `rocminfo | grep gfx`
+Not listed? To find your exact arch: `rocminfo | grep gfx`
 
 To bake the HIP paths into the project so you don't have to set env vars every time, uncomment and edit `.cargo/config.toml`:
 
