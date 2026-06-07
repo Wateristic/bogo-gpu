@@ -59,6 +59,8 @@ A distributed, GPU-accelerated shuffle worker that connects to `bogo.swapjs.dev`
 
 The default build targets NVIDIA GPUs using CUDA. `nvcc` compiles the kernel to PTX at build time; the PTX is embedded directly in the binary.
 
+Build using the x64 Native Tools Command Prompt for VS 2022
+
 ```sh
 # Build for the default GPU arch (sm_86, Ampere / RTX 30-series)
 cargo build --release
@@ -130,8 +132,6 @@ cargo build --release --no-default-features
 ## Running
 
 For CUDA:
-
-Run using the x64 Native Tools Command Prompt for VS 2022
 ```sh
 cargo run --release
 ```
