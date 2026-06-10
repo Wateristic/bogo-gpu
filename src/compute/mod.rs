@@ -54,8 +54,9 @@ impl Backend {
         match self {
             #[cfg(feature = "cuda")]
             Backend::Cuda(w) => {
-                let (best_correct, best_index, best_arr) =
+                let (best_correct, best_index) =
                     w.run_batch(seed, base_index, count)?;
+                let best_arr = Rng::new(seed, best_index).shuffle();
                 Ok(BatchResult { best_correct, best_arr, best_index })
             }
 
