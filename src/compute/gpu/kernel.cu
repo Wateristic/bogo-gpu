@@ -78,6 +78,13 @@ void bogo_shuffle_kernel(
 ) {
     __shared__ uint32_t fys[25 * 256];
 
+    // Best score found by any thread in this block. It only increases, and
+    // stale reads are safe: they can only make pruning less aggressive.
+    __shared__ uint32_t block_threshold;
+
+    if (threadIdx.x == 0) block_threshold = 0;
+    __syncthreads();
+
     // Column-major: arr[p] == fys[p * blockDim.x + threadIdx.x]
     // Zero bank conflicts for 32-wide warps.
     uint32_t *arr = fys + threadIdx.x;
@@ -100,7 +107,18 @@ void bogo_shuffle_kernel(
                       (end - t_start + (uint64_t)stride - 1) / (uint64_t)stride);
 
     // ── Per-thread search ─────────────────────────────────────────────────────
+    // Pruning invariant:
+    // Fisher-Yates fixes position i after step i; later steps only touch
+    // [0, i). We count fixed positions as they become final and keep a bitmask
+    // of values still in the active prefix. For each step, fixed + possible
+    // future fixed positions is an exact upper bound on this candidate's final
+    // score. If that bound cannot beat the block/thread best, we can stop early
+    // without changing exact-best semantics.
     for (uint32_t c = 0; c < my_iters; c++) {
+        uint32_t threshold = block_threshold;
+        if (best_c > threshold) threshold = best_c;
+        if (threshold >= 25) break;
+
         const uint64_t idx = t_start + (uint64_t)c * stride;
 
         uint32_t s[4];
@@ -109,23 +127,38 @@ void bogo_shuffle_kernel(
         #pragma unroll
         for (int p = 0; p < 25; p++) arr[p * 256] = (uint32_t)(p + 1);
 
+        uint32_t fixed = 0;
+        uint32_t active_mask = 0x01ffffffu;  // values 1..25 still active
+        bool aborted = false;
+
         #pragma unroll
         for (int i = 24; i >= 1; i--) {
             const uint32_t j   = rng_bounded(s, (uint32_t)(i + 1));
             const uint32_t tmp = arr[i * 256];
-            arr[i * 256] = arr[j * 256];
+            const uint32_t placed = arr[j * 256];
+            arr[i * 256] = placed;
             arr[j * 256] = tmp;
+
+            fixed += (placed == (uint32_t)(i + 1));
+            active_mask &= ~(1u << (placed - 1u));
+
+            const uint32_t future_mask = (1u << (uint32_t)i) - 1u;
+            const uint32_t possible_future = __popc(active_mask & future_mask);
+            if (fixed + possible_future <= threshold) {
+                aborted = true;
+                break;
+            }
         }
+        if (aborted) continue;
 
-        uint32_t fp = 0;
-        #pragma unroll
-        for (int p = 0; p < 25; p++) fp += (arr[p * 256] == (uint32_t)(p + 1));
-
+        // Positions 24..1 were counted as they became final; position 0 remains.
+        const uint32_t fp = fixed + (arr[0] == 1u);
         if (fp > best_c) {
             best_c = fp;
             best_i = idx;
             #pragma unroll
             for (int p = 0; p < 25; p++) best_arr[p] = (uint8_t)arr[p * 256];
+            atomicMax(&block_threshold, fp);
             if (fp == 25) break;
         }
     }
