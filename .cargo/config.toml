@@ -1,0 +1,11 @@
+# .cargo/config.toml
+#
+# Uncomment and set these if you want to bake HIP paths in rather than
+# passing them on the command line every time.
+#
+# [env]
+# HIP_ARCH  = "gfx1201"      # your GPU arch, e.g. gfx1103, gfx906, gfx1201
+# ROCM_PATH = "/usr"         # or "/opt/rocm"
+#
+# [target.x86_64-unknown-linux-gnu]
+# rustflags = ["-L", "native=/usr/lib64"]
