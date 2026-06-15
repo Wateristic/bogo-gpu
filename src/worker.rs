@@ -16,7 +16,7 @@ use crate::config::Config;
 use crate::history::{self, SavedArray};
  
 // Set this to 'true' for higher debugging and atleast itll FUCKING WORK NOW 
-const VERBOSE: bool = false;
+const VERBOSE: bool = true;
  
 // ── Shared GUI state (lock-free reads from egui, locked writes from worker) ──
  
@@ -715,10 +715,22 @@ impl NetClient {
             "job" => {
                 let seed_str = msg.get("seed").and_then(|s| s.as_str()).unwrap_or("").to_string();
                 let count    = msg.get("count").and_then(|c| c.as_u64()).unwrap_or(0);
-                if let Ok(seed) = seed_str.parse::<u64>() {
-                    tracing::info!("🎯 Job: seed={seed_str} count={count}");
-                    self.last_seed_str = Some(seed_str.clone());
-                    let _ = self.lease_tx.try_send(Lease { seed_str, seed, count });
+                match seed_str.parse::<u64>() {
+                    Ok(seed) => {
+                        tracing::info!("🎯 Job: seed={seed_str} count={count}");
+                        // Only record this as the "last seen" seed if it actually
+                        // made it into the scheduler's queue — otherwise last_seed_str
+                        // would point at work that was never started.
+                        match self.lease_tx.try_send(Lease { seed_str: seed_str.clone(), seed, count }) {
+                            Ok(()) => self.last_seed_str = Some(seed_str),
+                            Err(e) => tracing::warn!(
+                                "⚠️ dropped job seed={seed_str} count={count} — lease queue full ({e})"
+                            ),
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("⚠️ ignoring job with unparseable seed {seed_str:?}: {e}");
+                    }
                 }
             }
             "welcome" => {
@@ -750,34 +762,21 @@ impl NetClient {
                     g.status = format!("❌ rejected: {reason}");
                 }
  
-                // If the server rejected our result because it didn't
-                // recognize the seed we reported against, retry once using
-                // the most recent seed it has actually sent us via a "job"
-                // message (it may have moved on to a new seed between the
-                // time we received our lease and the time we reported).
+                // A "seed" rejection means the server had already moved on to a
+                // different lease before our report for the old one arrived.
+                // The best_arr/best_correct/best_index we computed are only
+                // meaningful for the seed they were computed against, so there's
+                // nothing valid to retry here — relabeling old results under a
+                // different seed would just send the server data that doesn't
+                // correspond to that seed. Log it for visibility and move on;
+                // the scheduler will send a fresh report for whatever lease is
+                // current.
                 if reason.to_lowercase().contains("seed") {
-                    if let (Some(retry_seed), Some(r)) =
-                        (self.last_seed_str.clone(), self.last_report.clone())
-                    {
-                        if retry_seed != r.seed_str {
-                            tracing::warn!(
-                                "🔁 retrying report with most recently seen seed={} (was {})",
-                                retry_seed, r.seed_str
-                            );
-                            let arr: Vec<u32> = r.best_arr.iter().map(|&v| v as u32).collect();
-                            let retry_msg = serde_json::json!({
-                                "type":         "result",
-                                "seed":         retry_seed,
-                                "total_done":   r.total_done,
-                                "best_correct": r.best_correct,
-                                "best_arr":     arr,
-                                "best_index":   r.best_index,
-                            }).to_string();
-                            if VERBOSE {
-                                eprintln!("[net] -> {retry_msg}");
-                            }
-                            return Ok(Some(Message::Text(retry_msg)));
-                        }
+                    if let Some(r) = &self.last_report {
+                        tracing::warn!(
+                            "🔁 dropping stale report for seed={} (server has moved on, last_seed_str={:?})",
+                            r.seed_str, self.last_seed_str
+                        );
                     }
                 }
             }
