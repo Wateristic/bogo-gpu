@@ -159,7 +159,7 @@ impl Worker {
     pub fn new(stats: Arc<GuiStats>) -> Self {
         Worker { stats, autostart: None }
     }
-
+ 
     /// Like `Worker::new`, but immediately starts a session with `config`
     /// once `run()` begins -- for headless mode (no GUI to click Start).
     pub fn new_with_autostart(stats: Arc<GuiStats>, config: Config) -> Self {
@@ -173,7 +173,7 @@ impl Worker {
             let mut lock = self.stats.cmd_tx.lock().unwrap();
             *lock = Some(cmd_tx.clone());
         }
-
+ 
         if let Some(cfg) = self.autostart.clone() {
             let _ = cmd_tx.send(WorkerCmd::Start(cfg));
         }
@@ -262,6 +262,8 @@ impl Worker {
             lease_tx,
             report_rx,
             stats:     Arc::clone(&self.stats),
+            last_seed_str: None,
+            last_report:   None,
         };
         let net_handle = tokio::spawn(net.run(cancel.clone()));
  
@@ -486,7 +488,7 @@ impl Scheduler {
                         g.session_best     = win_best as u32;
                         g.session_best_arr = win_arr;
                     }
-
+ 
                     let mut best_record: Option<history::BestRecord> = None;
                     if win_best as u32 > g.all_time_best {
                         g.all_time_best     = win_best as u32;
@@ -499,7 +501,7 @@ impl Scheduler {
                             timestamp: history::now_unix(),
                         });
                     }
-
+ 
                     g.ticks.push(tick);
                     if g.ticks.len() > 120 {
                         g.ticks.remove(0);
@@ -566,6 +568,14 @@ struct NetClient {
     lease_tx:  mpsc::Sender<Lease>,
     report_rx: mpsc::Receiver<Report>,
     stats:     Arc<GuiStats>,
+    /// Most recent seed string the server has sent us via a "job" message.
+    /// Used to recover if the server rejects a "result" because the seed
+    /// we reported against is no longer (or not yet) what it considers current.
+    last_seed_str: Option<String>,
+    /// The most recently sent "result" report, kept around so it can be
+    /// resent under a different seed if the server rejects it for an
+    /// unknown/stale seed.
+    last_report:   Option<Report>,
 }
  
 impl NetClient {
@@ -633,7 +643,9 @@ impl NetClient {
                 msg = read.next() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
-                            self.handle_message(&text, cancel).await?;
+                            if let Some(retry) = self.handle_message(&text, cancel).await? {
+                                write.send(retry).await?;
+                            }
                         }
                         Some(Ok(Message::Ping(data))) => {
                             if VERBOSE {
@@ -670,6 +682,7 @@ impl NetClient {
                             if VERBOSE {
                                 eprintln!("[net] -> {msg}");
                             }
+                            self.last_report = Some(r);
                         }
                         None => break,
                     }
@@ -688,13 +701,13 @@ impl NetClient {
         Ok(())
     }
  
-    async fn handle_message(&self, text: &str, cancel: &CancellationToken) -> Result<()> {
+    async fn handle_message(&mut self, text: &str, cancel: &CancellationToken) -> Result<Option<Message>> {
         if VERBOSE {
             eprintln!("[net] <- {text}");
         }
  
         let Ok(msg) = serde_json::from_str::<serde_json::Value>(text) else {
-            return Ok(());
+            return Ok(None);
         };
         let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
  
@@ -704,6 +717,7 @@ impl NetClient {
                 let count    = msg.get("count").and_then(|c| c.as_u64()).unwrap_or(0);
                 if let Ok(seed) = seed_str.parse::<u64>() {
                     tracing::info!("🎯 Job: seed={seed_str} count={count}");
+                    self.last_seed_str = Some(seed_str.clone());
                     let _ = self.lease_tx.try_send(Lease { seed_str, seed, count });
                 }
             }
@@ -735,6 +749,37 @@ impl NetClient {
                     let mut g = self.stats.inner.lock().unwrap();
                     g.status = format!("❌ rejected: {reason}");
                 }
+ 
+                // If the server rejected our result because it didn't
+                // recognize the seed we reported against, retry once using
+                // the most recent seed it has actually sent us via a "job"
+                // message (it may have moved on to a new seed between the
+                // time we received our lease and the time we reported).
+                if reason.to_lowercase().contains("seed") {
+                    if let (Some(retry_seed), Some(r)) =
+                        (self.last_seed_str.clone(), self.last_report.clone())
+                    {
+                        if retry_seed != r.seed_str {
+                            tracing::warn!(
+                                "🔁 retrying report with most recently seen seed={} (was {})",
+                                retry_seed, r.seed_str
+                            );
+                            let arr: Vec<u32> = r.best_arr.iter().map(|&v| v as u32).collect();
+                            let retry_msg = serde_json::json!({
+                                "type":         "result",
+                                "seed":         retry_seed,
+                                "total_done":   r.total_done,
+                                "best_correct": r.best_correct,
+                                "best_arr":     arr,
+                                "best_index":   r.best_index,
+                            }).to_string();
+                            if VERBOSE {
+                                eprintln!("[net] -> {retry_msg}");
+                            }
+                            return Ok(Some(Message::Text(retry_msg)));
+                        }
+                    }
+                }
             }
             "banned" => {
                 let reason = msg.get("reason").and_then(|r| r.as_str()).unwrap_or(text);
@@ -745,6 +790,6 @@ impl NetClient {
                 tracing::debug!("📨 Server ({other}): {text}");
             }
         }
-        Ok(())
+        Ok(None)
     }
 }
