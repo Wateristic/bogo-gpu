@@ -16,7 +16,7 @@ use crate::config::Config;
 use crate::history::{self, SavedArray};
  
 // Set this to 'true' for higher debugging and atleast itll FUCKING WORK NOW 
-const VERBOSE: bool = true;
+const VERBOSE: bool = false;
  
 // ── Shared GUI state (lock-free reads from egui, locked writes from worker) ──
  
