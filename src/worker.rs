@@ -159,7 +159,7 @@ impl Worker {
     pub fn new(stats: Arc<GuiStats>) -> Self {
         Worker { stats, autostart: None }
     }
-
+ 
     /// Like `Worker::new`, but immediately starts a session with `config`
     /// once `run()` begins -- for headless mode (no GUI to click Start).
     pub fn new_with_autostart(stats: Arc<GuiStats>, config: Config) -> Self {
@@ -173,7 +173,7 @@ impl Worker {
             let mut lock = self.stats.cmd_tx.lock().unwrap();
             *lock = Some(cmd_tx.clone());
         }
-
+ 
         if let Some(cfg) = self.autostart.clone() {
             let _ = cmd_tx.send(WorkerCmd::Start(cfg));
         }
@@ -254,6 +254,7 @@ impl Worker {
             chunk_tx,
             done_rx,
             stats:     Arc::clone(&self.stats),
+            last_report: tokio::time::Instant::now(),
         };
         let sched_handle = tokio::spawn(sched.run(cancel.clone()));
  
@@ -355,6 +356,12 @@ struct Scheduler {
     chunk_tx:  mpsc::Sender<Chunk>,
     done_rx:   mpsc::Receiver<RangeResult>,
     stats:     Arc<GuiStats>,
+    /// Wall-clock time of the last "result" sent to the server. Lives on the
+    /// Scheduler (not inside `process_lease`) so the once-per-second cadence
+    /// is preserved across lease switches — otherwise a lease boundary would
+    /// reset the timer and let a burst of reports through right after a GPU
+    /// stall causes several leases to be processed back-to-back.
+    last_report: tokio::time::Instant,
 }
  
 impl Scheduler {
@@ -398,7 +405,6 @@ impl Scheduler {
         let mut win_best:      i32 = -1;
         let mut win_arr              = [0u8; 25];
         let mut win_index:     u64 = 0;
-        let mut last_report         = tokio::time::Instant::now();
         // Set once a fresher job arrives mid-lease; once set we stop
         // dispatching new chunks for `lease` and wrap up as soon as the
         // in-flight chunk completes.
@@ -465,13 +471,13 @@ impl Scheduler {
             }
  
             let lease_done = next_lease.is_some() || (total_done >= lease.count && in_flight == 0);
-            let report_due = last_report.elapsed() >= REPORT_INTERVAL;
+            let report_due = self.last_report.elapsed() >= REPORT_INTERVAL;
  
             if (report_due || lease_done) && win_best >= 0 {
                 if VERBOSE {
                     eprintln!(
-                        "[sched] tick: best={} shuffles={} total_done={}/{} since_last_report={:?}",
-                        win_best, tick_done, total_done, lease.count, last_report.elapsed()
+                        "[sched] tick: best={} shuffles={} total_done={}/{} report_due={} since_last_report={:?}",
+                        win_best, tick_done, total_done, lease.count, report_due, self.last_report.elapsed()
                     );
                 }
  
@@ -486,7 +492,7 @@ impl Scheduler {
                         g.session_best     = win_best as u32;
                         g.session_best_arr = win_arr;
                     }
-
+ 
                     let mut best_record: Option<history::BestRecord> = None;
                     if win_best as u32 > g.all_time_best {
                         g.all_time_best     = win_best as u32;
@@ -499,7 +505,7 @@ impl Scheduler {
                             timestamp: history::now_unix(),
                         });
                     }
-
+ 
                     g.ticks.push(tick);
                     if g.ticks.len() > 120 {
                         g.ticks.remove(0);
@@ -537,19 +543,33 @@ impl Scheduler {
                     }
                 }
  
-                let _ = self.report_tx.send(Report {
-                    seed_str:     lease.seed_str.clone(),
-                    total_done,
-                    best_correct: win_best as u32,
-                    best_arr:     win_arr,
-                    best_index:   win_index,
-                }).await;
+                // Only actually talk to the server once per second. `lease_done`
+                // can fire on its own (e.g. a new job arriving mid-chunk, or a
+                // burst of leases racing through back-to-back after the
+                // compute side stalls/lags) — without this check that would
+                // push a second "result" to the server within the same
+                // second as the last one, which the server may treat as a
+                // stale/duplicate submission for the same seed (rejected as
+                // "unknown_seed" right after a "credited" for that seed).
+                // Local GUI/history bookkeeping above still happens on every
+                // lease boundary so nothing visible is lost — only the
+                // network submission itself is rate-limited.
+                if report_due {
+                    let _ = self.report_tx.send(Report {
+                        seed_str:     lease.seed_str.clone(),
+                        total_done,
+                        best_correct: win_best as u32,
+                        best_arr:     win_arr,
+                        best_index:   win_index,
+                    }).await;
+ 
+                    self.last_report = tokio::time::Instant::now();
+                }
  
                 win_best  = -1;
                 win_arr   = [0u8; 25];
                 win_index = 0;
                 tick_done = 0;
-                last_report = tokio::time::Instant::now();
             }
  
             if lease_done { break; }
