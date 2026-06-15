@@ -16,7 +16,7 @@ use crate::config::Config;
 use crate::history::{self, SavedArray};
  
 // Set this to 'true' for higher debugging and atleast itll FUCKING WORK NOW 
-const VERBOSE: bool = false;
+const VERBOSE: bool = true;
  
 // ── Shared GUI state (lock-free reads from egui, locked writes from worker) ──
  
@@ -159,7 +159,7 @@ impl Worker {
     pub fn new(stats: Arc<GuiStats>) -> Self {
         Worker { stats, autostart: None }
     }
- 
+
     /// Like `Worker::new`, but immediately starts a session with `config`
     /// once `run()` begins -- for headless mode (no GUI to click Start).
     pub fn new_with_autostart(stats: Arc<GuiStats>, config: Config) -> Self {
@@ -173,7 +173,7 @@ impl Worker {
             let mut lock = self.stats.cmd_tx.lock().unwrap();
             *lock = Some(cmd_tx.clone());
         }
- 
+
         if let Some(cfg) = self.autostart.clone() {
             let _ = cmd_tx.send(WorkerCmd::Start(cfg));
         }
@@ -262,8 +262,6 @@ impl Worker {
             lease_tx,
             report_rx,
             stats:     Arc::clone(&self.stats),
-            last_seed_str: None,
-            last_report:   None,
         };
         let net_handle = tokio::spawn(net.run(cancel.clone()));
  
@@ -488,7 +486,7 @@ impl Scheduler {
                         g.session_best     = win_best as u32;
                         g.session_best_arr = win_arr;
                     }
- 
+
                     let mut best_record: Option<history::BestRecord> = None;
                     if win_best as u32 > g.all_time_best {
                         g.all_time_best     = win_best as u32;
@@ -501,7 +499,7 @@ impl Scheduler {
                             timestamp: history::now_unix(),
                         });
                     }
- 
+
                     g.ticks.push(tick);
                     if g.ticks.len() > 120 {
                         g.ticks.remove(0);
@@ -568,14 +566,6 @@ struct NetClient {
     lease_tx:  mpsc::Sender<Lease>,
     report_rx: mpsc::Receiver<Report>,
     stats:     Arc<GuiStats>,
-    /// Most recent seed string the server has sent us via a "job" message.
-    /// Used to recover if the server rejects a "result" because the seed
-    /// we reported against is no longer (or not yet) what it considers current.
-    last_seed_str: Option<String>,
-    /// The most recently sent "result" report, kept around so it can be
-    /// resent under a different seed if the server rejects it for an
-    /// unknown/stale seed.
-    last_report:   Option<Report>,
 }
  
 impl NetClient {
@@ -643,9 +633,7 @@ impl NetClient {
                 msg = read.next() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
-                            if let Some(retry) = self.handle_message(&text, cancel).await? {
-                                write.send(retry).await?;
-                            }
+                            self.handle_message(&text, cancel).await?;
                         }
                         Some(Ok(Message::Ping(data))) => {
                             if VERBOSE {
@@ -682,7 +670,6 @@ impl NetClient {
                             if VERBOSE {
                                 eprintln!("[net] -> {msg}");
                             }
-                            self.last_report = Some(r);
                         }
                         None => break,
                     }
@@ -701,13 +688,13 @@ impl NetClient {
         Ok(())
     }
  
-    async fn handle_message(&mut self, text: &str, cancel: &CancellationToken) -> Result<Option<Message>> {
+    async fn handle_message(&self, text: &str, cancel: &CancellationToken) -> Result<()> {
         if VERBOSE {
             eprintln!("[net] <- {text}");
         }
  
         let Ok(msg) = serde_json::from_str::<serde_json::Value>(text) else {
-            return Ok(None);
+            return Ok(());
         };
         let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
  
@@ -715,22 +702,9 @@ impl NetClient {
             "job" => {
                 let seed_str = msg.get("seed").and_then(|s| s.as_str()).unwrap_or("").to_string();
                 let count    = msg.get("count").and_then(|c| c.as_u64()).unwrap_or(0);
-                match seed_str.parse::<u64>() {
-                    Ok(seed) => {
-                        tracing::info!("🎯 Job: seed={seed_str} count={count}");
-                        // Only record this as the "last seen" seed if it actually
-                        // made it into the scheduler's queue — otherwise last_seed_str
-                        // would point at work that was never started.
-                        match self.lease_tx.try_send(Lease { seed_str: seed_str.clone(), seed, count }) {
-                            Ok(()) => self.last_seed_str = Some(seed_str),
-                            Err(e) => tracing::warn!(
-                                "⚠️ dropped job seed={seed_str} count={count} — lease queue full ({e})"
-                            ),
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("⚠️ ignoring job with unparseable seed {seed_str:?}: {e}");
-                    }
+                if let Ok(seed) = seed_str.parse::<u64>() {
+                    tracing::info!("🎯 Job: seed={seed_str} count={count}");
+                    let _ = self.lease_tx.try_send(Lease { seed_str, seed, count });
                 }
             }
             "welcome" => {
@@ -761,24 +735,6 @@ impl NetClient {
                     let mut g = self.stats.inner.lock().unwrap();
                     g.status = format!("❌ rejected: {reason}");
                 }
- 
-                // A "seed" rejection means the server had already moved on to a
-                // different lease before our report for the old one arrived.
-                // The best_arr/best_correct/best_index we computed are only
-                // meaningful for the seed they were computed against, so there's
-                // nothing valid to retry here — relabeling old results under a
-                // different seed would just send the server data that doesn't
-                // correspond to that seed. Log it for visibility and move on;
-                // the scheduler will send a fresh report for whatever lease is
-                // current.
-                if reason.to_lowercase().contains("seed") {
-                    if let Some(r) = &self.last_report {
-                        tracing::warn!(
-                            "🔁 dropping stale report for seed={} (server has moved on, last_seed_str={:?})",
-                            r.seed_str, self.last_seed_str
-                        );
-                    }
-                }
             }
             "banned" => {
                 let reason = msg.get("reason").and_then(|r| r.as_str()).unwrap_or(text);
@@ -789,6 +745,6 @@ impl NetClient {
                 tracing::debug!("📨 Server ({other}): {text}");
             }
         }
-        Ok(None)
+        Ok(())
     }
 }
